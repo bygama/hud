@@ -11,32 +11,64 @@ folder per host.
 ## Claude Code
 
 ```
-Model: Fable 5 | 5h:[--------]2%(4h37m) | wk:[#-------]9%(6d9h) | session:0m | ctx:[##--------]24%
+Fable 5 | mateo | 5h:[--------]2%(4h37m) | wk:[#-------]9%(6d9h) | session:0m | ctx:[##--------]24%
 ```
 
-Shrinks in stages as the terminal narrows — bars go first, then `Model:`,
-then reset times and `session:`, down to bare `5h:2% | wk:9% | ctx:24%`.
+Shrinks in stages as the terminal narrows — bars go first, then the model,
+then reset times and `session:`, down to bare `m | 5h:2% | wk:9% | ctx:24%`.
 Always one line (see `COLUMNS`/`LINES` in [Test](#test)).
 
 ## Segments
 
 | Segment | Source | Colors |
 |---|---|---|
-| `Model:` | stdin `model.display_name` | cyan |
-| `5h:` / `wk:` | stdin `rate_limits`, else OAuth usage API (90s cache) | green <70, yellow ≥70, red ≥90 |
+| model | stdin `model.display_name` (`Fable` renders as `Fabio`, a local pet name) | cyan |
+| account chip | credential token → email via OAuth profile endpoint (cached per config dir, keyed by token hash) | per-account via `accounts.json`, dim when unmapped, red + `!` on a foreign credential |
+| `5h:` / `wk:` | stdin `rate_limits`, else OAuth usage API (90s cache, invalidated when the token changes) | green <70, yellow ≥70, red ≥90 |
 | `session:` | first transcript line timestamp | yellow >60m, red >120m |
 | `ctx:` | stdin `context_window.used_percentage` (+fallback math) | yellow ≥70, `COMPRESS?` ≥80, `CRITICAL` red ≥85 |
 
 ### Install
 
-`~/.claude/settings.json`:
+`~/.claude/settings.json` (adjust the clone path):
 
 ```json
 "statusLine": {
   "type": "command",
-  "command": "node C:/Briar/repos/mine/hud/src/claude/statusline.mjs"
+  "command": "node C:/path/to/hud/src/claude/statusline.mjs",
+  "refreshInterval": 60
 }
 ```
+
+### Account chip
+
+Works with zero configuration: the chip resolves which account the session's
+credential actually bills (not which config dir it sits in — a swapped
+credential shows within one refresh) and renders the email's localpart in
+gray. To get short labels, colors, and the wrong-account alarm, create
+`~/.config/hud/accounts.json`:
+
+```json
+{
+  "accounts": {
+    "you@example.com":  { "label": "personal", "color": "#9DC0B7" },
+    "work@example.com": { "label": "work", "color": "magenta" }
+  },
+  "slots": {
+    "~/.claude": "you@example.com",
+    "~/.claude-work": "work@example.com"
+  }
+}
+```
+
+- `color` is a `#RRGGBB` truecolor hex (pick them from your terminal theme)
+  or a classic ANSI name (`cyan`, `magenta`, ...).
+- `slots` declares which account OWNS each `CLAUDE_CONFIG_DIR`. If a
+  session's credential doesn't match its dir's owner, the chip renders
+  red with `!` — the tripwire for a credential swapped behind your back.
+- Single-account setups can skip the file entirely; multi-account setups
+  want it. The file is yours and local — never commit it (it holds your
+  emails).
 
 ## Codex CLI
 
