@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
  * hud — standalone Claude Code statusline.
- * Renders: Model: X | 5h:[####----]N%(4h38m) | wk:[#-------]N%(6d10h) | session:Nm | ctx:[##--------]N%
+ * Renders: <model> | acct | 5h:[####----]N%(4h38m) | wk:[#-------]N%(6d10h) | session:Nm | ctx:[##--------]N%
  * Shrinks in stages as the terminal narrows: bars go first, then Model, then reset
  * times + session, down to bare "5h:N% | wk:N% | ctx:N%". Always one line, no wrap.
  * Data: Claude Code statusline stdin JSON (primary); OAuth usage API (fallback for rate limits).
  * Zero dependencies. Never throws: worst case prints a minimal line.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, openSync, readSync, closeSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -74,9 +75,11 @@ async function readStdin() {
 }
 
 // ---------- segments ----------
+// No "Model:" prefix — the name is recognizable on its own and the chars are
+// better spent on the bars. "Fable" renders as "Fabio", a local pet name.
 export function modelSegment(stdin) {
   const name = stdin?.model?.display_name?.trim() || stdin?.model?.id?.trim();
-  return name ? `${CYAN}Model: ${name}${R}` : null;
+  return name ? `${CYAN}${name.replace(/\bfable\b/i, "Fabio")}${R}` : null;
 }
 
 export function contextPercent(stdin) {
@@ -137,26 +140,59 @@ export function limitsFromStdin(stdin) {
   };
 }
 
-const CACHE_FILE = join(tmpdir(), "hud-usage-cache.json");
 const CACHE_TTL_MS = 90_000;
 
-async function limitsFromApi() {
+export function configDir(env = process.env) {
+  return env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+}
+
+// Several accounts can share one machine (CLAUDE_CONFIG_DIR is the only thing
+// separating them), and they then share one tmpdir too. An unkeyed cache file
+// makes whichever statusline refreshed last serve ITS usage to every other
+// account — and since refreshInterval is typically below the 90s TTL, that
+// collision is the common case, not a rare race. Key the file by config dir so
+// each account caches its own numbers.
+export function dirKey(env = process.env) {
+  return createHash("sha256").update(resolve(configDir(env))).digest("hex").slice(0, 8);
+}
+
+export function usageCacheFile(env = process.env, dir = tmpdir()) {
+  return join(dir, `hud-usage-cache-${dirKey(env)}.json`);
+}
+
+function readOAuthCredentials(dir = configDir()) {
   try {
-    const cached = JSON.parse(readFileSync(CACHE_FILE, "utf8"));
-    if (Date.now() - cached.ts < CACHE_TTL_MS) return cached.data;
-  } catch { /* no cache */ }
-  try {
-    const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-    const raw = JSON.parse(readFileSync(join(configDir, ".credentials.json"), "utf8"));
+    const raw = JSON.parse(readFileSync(join(dir, ".credentials.json"), "utf8"));
     const creds = raw.claudeAiOauth ?? raw;
     // No refresh here: Claude Code keeps this token fresh; expired -> skip quietly.
     if (!creds.accessToken || (creds.expiresAt && creds.expiresAt <= Date.now())) return null;
+    return creds;
+  } catch { return null; }
+}
+
+function oauthHeaders(token) {
+  return {
+    Authorization: `Bearer ${token}`,
+    "anthropic-beta": "oauth-2025-04-20",
+    "Content-Type": "application/json",
+  };
+}
+
+async function limitsFromApi() {
+  const creds = readOAuthCredentials();
+  if (!creds) return null;
+  // The cache is validated against the token, not just the dir: a credential
+  // swapped into this dir (login in the wrong window, Orca's account manager)
+  // must never be served the previous account's bars, not even for the TTL.
+  const tokenHash = createHash("sha256").update(creds.accessToken).digest("hex").slice(0, 16);
+  const cacheFile = usageCacheFile();
+  try {
+    const cached = JSON.parse(readFileSync(cacheFile, "utf8"));
+    if (cached.tokenHash === tokenHash && Date.now() - cached.ts < CACHE_TTL_MS) return cached.data;
+  } catch { /* no cache */ }
+  try {
     const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
-      headers: {
-        Authorization: `Bearer ${creds.accessToken}`,
-        "anthropic-beta": "oauth-2025-04-20",
-        "Content-Type": "application/json",
-      },
+      headers: oauthHeaders(creds.accessToken),
       signal: AbortSignal.timeout(3000),
     });
     if (!res.ok) return null;
@@ -165,8 +201,99 @@ async function limitsFromApi() {
       fiveHour: { pct: body.five_hour?.utilization, resetsAt: body.five_hour?.resets_at },
       week: { pct: body.seven_day?.utilization, resetsAt: body.seven_day?.resets_at },
     };
-    try { writeFileSync(CACHE_FILE, JSON.stringify({ ts: Date.now(), data })); } catch { /* best effort */ }
+    try { writeFileSync(cacheFile, JSON.stringify({ ts: Date.now(), tokenHash, data })); } catch { /* best effort */ }
     return data;
+  } catch { return null; }
+}
+
+// ---------- account identity chip ----------
+// Which account is this session actually billing? The config dir alone can't
+// answer that: a third-party account manager (Orca) swaps .credentials.json
+// inside a dir without touching anything else, so the chip identifies the
+// CREDENTIAL, not the folder. The token is hashed and mapped to an email via
+// the OAuth profile endpoint, cached per config dir keyed by that hash — so
+// the network is hit only when the token actually changes (login, refresh,
+// swap), and a swap under a live session shows up on the next refresh.
+//
+// ~/.config/hud/accounts.json (optional, never committed anywhere) maps
+// emails to short labels and colors, and declares which account OWNS each
+// config dir. A credential that doesn't match its slot's owner renders red
+// with a "!" — that's the tripwire for exactly the silent-swap case.
+export function accountsConfigPath() {
+  return join(homedir(), ".config", "hud", "accounts.json");
+}
+
+export function loadAccountsConfig(path = accountsConfigPath()) {
+  try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
+}
+
+// "#9DC0B7" -> 24-bit color escape; "cyan" -> classic ANSI; anything else -> null.
+// Hexes let the mapping follow a terminal theme; names keep it usable without one.
+const ANSI_NAMES = { black: 30, red: 31, green: 32, yellow: 33, blue: 34, magenta: 35, cyan: 36, white: 37 };
+export function chipColor(spec) {
+  const hex = /^#?([0-9a-fA-F]{6})$/.exec(spec ?? "");
+  if (hex) {
+    const n = parseInt(hex[1], 16);
+    return `\x1b[38;2;${(n >> 16) & 255};${(n >> 8) & 255};${n & 255}m`;
+  }
+  const code = ANSI_NAMES[String(spec ?? "").toLowerCase()];
+  return code ? `\x1b[${code}m` : null;
+}
+
+// Slot keys accept "~/..." and, on Windows, compare case-insensitively.
+export function slotOwner(cfg, dir) {
+  const fold = process.platform === "win32" ? (s) => s.toLowerCase() : (s) => s;
+  const norm = (p) => fold(resolve(String(p).replace(/^~(?=$|[\\/])/, homedir())));
+  for (const [slot, email] of Object.entries(cfg?.slots ?? {})) {
+    if (norm(slot) === norm(dir)) return email;
+  }
+  return null;
+}
+
+export function accountChip(email, dir, cfg, { narrow = false } = {}) {
+  if (!email) return null;
+  const entry = cfg?.accounts?.[email];
+  const base = entry?.label ?? email.split("@")[0].slice(0, 10);
+  const label = narrow ? base.slice(0, 1) : base;
+  const owner = slotOwner(cfg, dir);
+  if (owner && owner !== email) return `${RED}${label}!${R}`; // foreign credential in this slot
+  const color = (entry && chipColor(entry.color)) ?? DIM;
+  return `${color}${label}${R}`;
+}
+
+async function accountEmail() {
+  const dir = configDir();
+  const cacheFile = join(tmpdir(), `hud-acct-cache-${dirKey()}.json`);
+  const creds = readOAuthCredentials(dir);
+  if (creds) {
+    const tokenHash = createHash("sha256").update(creds.accessToken).digest("hex").slice(0, 16);
+    try {
+      const cached = JSON.parse(readFileSync(cacheFile, "utf8"));
+      if (cached.tokenHash === tokenHash && cached.email) return cached.email;
+    } catch { /* no cache yet */ }
+    try {
+      const res = await fetch("https://api.anthropic.com/api/oauth/profile", {
+        headers: oauthHeaders(creds.accessToken),
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.ok) {
+        const email = (await res.json()).account?.email;
+        if (email) {
+          try { writeFileSync(cacheFile, JSON.stringify({ tokenHash, email })); } catch { /* best effort */ }
+          return email;
+        }
+      }
+    } catch { /* offline -> fall through */ }
+  }
+  // Last-login identity as fallback. Claude Code keeps .claude.json at the
+  // home root for the default dir and inside the dir when CLAUDE_CONFIG_DIR
+  // is set. It goes stale against a swapped credential, so it never overrides
+  // the profile lookup above — it only fills in when the network can't.
+  try {
+    const cfgJson = process.env.CLAUDE_CONFIG_DIR?.trim()
+      ? join(dir, ".claude.json")
+      : join(homedir(), ".claude.json");
+    return JSON.parse(readFileSync(cfgJson, "utf8")).oauthAccount?.emailAddress ?? null;
   } catch { return null; }
 }
 
@@ -201,22 +328,26 @@ export function visibleWidth(str) {
 // then session, then reset times (down to bare 5h/wk label:%) — reset times
 // outlast session since knowing when a limit frees up is more useful than the
 // session clock, and the context bar outlasts everything since it's the segment
-// most worth a glance even in the tightest terminal. Each level is tried in order
-// and the first that fits `width` on one line wins; if even the barest level
-// doesn't fit, it's printed anyway (overflow, never truncated).
-export function buildLevels(stdin, limits) {
+// most worth a glance even in the tightest terminal. The account chip never
+// drops entirely — knowing WHO is being billed matters at every width — it
+// only shrinks to its first letter alongside the narrow levels. Each level is
+// tried in order and the first that fits `width` on one line wins; if even the
+// barest level doesn't fit, it's printed anyway (overflow, never truncated).
+export function buildLevels(stdin, limits, acct = null) {
   const model = modelSegment(stdin);
   const session = sessionSegment(stdin);
   const ctx = contextSegment(stdin);
+  const a = acct?.full ?? null;
+  const an = acct?.narrow ?? null;
   const fiveHour = (opts) => limits ? limitSegment("5h", limits.fiveHour.pct, limits.fiveHour.resetsAt, opts) : null;
   const week = (opts) => limits ? limitSegment("wk", limits.week.pct, limits.week.resetsAt, { dimLabel: true, ...opts }) : null;
 
   const levels = [
-    [model, fiveHour({}), week({}), session, ctx],
-    [model, fiveHour({ showBar: false }), week({ showBar: false }), session, ctx],
-    [fiveHour({ showBar: false }), week({ showBar: false }), session, ctx],
-    [fiveHour({ showBar: false }), week({ showBar: false }), ctx],
-    [fiveHour({ showBar: false, showReset: false }), week({ showBar: false, showReset: false }), ctx],
+    [model, a, fiveHour({}), week({}), session, ctx],
+    [model, a, fiveHour({ showBar: false }), week({ showBar: false }), session, ctx],
+    [a, fiveHour({ showBar: false }), week({ showBar: false }), session, ctx],
+    [an, fiveHour({ showBar: false }), week({ showBar: false }), ctx],
+    [an, fiveHour({ showBar: false, showReset: false }), week({ showBar: false, showReset: false }), ctx],
   ];
   return levels.map((segs) => segs.filter(Boolean));
 }
@@ -234,8 +365,18 @@ async function main() {
   const stdin = await readStdin();
   const stdinLimits = limitsFromStdin(stdin);
   const stale = stdinLimits && (isExpired(stdinLimits.fiveHour.resetsAt) || isExpired(stdinLimits.week.resetsAt));
-  const limits = stdinLimits && !stale ? stdinLimits : (await limitsFromApi()) ?? stdinLimits;
-  const levels = buildLevels(stdin, limits);
+  // Limits and identity resolve concurrently; each is usually a cache hit.
+  const [apiLimits, email] = await Promise.all([
+    stdinLimits && !stale ? null : limitsFromApi(),
+    accountEmail(),
+  ]);
+  const limits = stdinLimits && !stale ? stdinLimits : apiLimits ?? stdinLimits;
+  const cfg = loadAccountsConfig();
+  const acct = email ? {
+    full: accountChip(email, configDir(), cfg),
+    narrow: accountChip(email, configDir(), cfg, { narrow: true }),
+  } : null;
+  const levels = buildLevels(stdin, limits, acct);
   console.log(renderLine(levels, terminalWidth()));
 }
 

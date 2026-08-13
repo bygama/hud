@@ -2,9 +2,9 @@
 
 Statuslines for AI coding agents, one folder per host under `src/`. The
 Claude Code statusline (`src/claude/statusline.mjs`) is one zero-dependency
-Node script rendering model, 5h/weekly rate-limit bars, session timer, and
-context bar. Replaces the OMC HUD. Codex integration lives in `src/codex/`
-(see `## Codex compatibility`).
+Node script rendering model, account chip, 5h/weekly rate-limit bars,
+session timer, and context bar. Replaces the OMC HUD. Codex integration
+lives in `src/codex/` (see `## Codex compatibility`).
 
 ## Layout
 
@@ -29,9 +29,30 @@ root. Local tool state (`.codex/`, `.omc/`, `.worktrees/`) is gitignored.
 - Claude Code pipes the statusline JSON on stdin (`rate_limits`,
   `context_window`, `model`, `transcript_path`); the OAuth fallback only
   fires when stdin carries no rate limits. Fallback reads
-  `~/.claude/.credentials.json` and never refreshes the token (Claude Code
-  keeps it fresh) — an expired token silently drops the bars, by design.
-- Usage-API responses cache 90s in `%TEMP%/hud-usage-cache.json`.
+  `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`) and never
+  refreshes the token (Claude Code keeps it fresh) — an expired token silently
+  drops the bars, by design.
+- Usage-API responses cache 90s in
+  `%TEMP%/hud-usage-cache-<8-hex>.json`, where the suffix hashes the config
+  dir. It MUST stay keyed: accounts are separated only by
+  `CLAUDE_CONFIG_DIR` and share one tmpdir, so an unkeyed file served
+  whichever account refreshed last to all the others — and with
+  `refreshInterval` below the 90s TTL that was the common case, not a race.
+  5h windows are globally aligned, so a wrong reading carries a plausible
+  `resets_at` and only the percentage looks off.
+- The account chip identifies the CREDENTIAL, not the config dir: token
+  hash → email via `api.anthropic.com/api/oauth/profile`, cached per dir in
+  `%TEMP%/hud-acct-cache-<8-hex>.json` keyed by the token hash, so the
+  network is hit only when the token changes and a credential swapped under
+  a live session (Orca's account manager does this) shows within one
+  refresh. `~/.config/hud/accounts.json` (optional, never committed; on
+  this machine restored by workstation's `accounts/` step) maps emails to
+  labels/colors (`#RRGGBB` truecolor or classic ANSI names) and declares
+  each dir's owning account — a foreign credential in an owned slot renders
+  red with `!`. Fallback when the network is out: `.claude.json`
+  `oauthAccount` (home root for the default dir, inside the dir when
+  `CLAUDE_CONFIG_DIR` is set), which can be stale — it never overrides the
+  profile lookup.
 - Session start is parsed from the FIRST line of the transcript (head read);
   a missing/unreadable transcript renders `session:0m`, not an error.
 - Wired in `~/.claude/settings.json` → `statusLine.command`; changes to
