@@ -1,12 +1,15 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  accountChip,
   bar,
   buildLevels,
+  chipColor,
   clampPct,
+  configDir,
   contextPercent,
   contextSegment,
   formatReset,
@@ -19,7 +22,9 @@ import {
   resetMs,
   sessionSegment,
   sessionStartMs,
+  slotOwner,
   terminalWidth,
+  usageCacheFile,
   visibleWidth,
 } from '../../src/claude/statusline.mjs';
 
@@ -184,9 +189,10 @@ test('limitSegment drops bar and reset on request, and clamps', () => {
 
 // ---------- model ----------
 
-test('modelSegment prefers display_name and falls back to id', () => {
-  assert.match(modelSegment({ model: { display_name: 'Fable 5' } }), /Model: Fable 5/);
-  assert.match(modelSegment({ model: { id: 'claude-fable-5' } }), /Model: claude-fable-5/);
+test('modelSegment prefers display_name, falls back to id, and pet-names Fable', () => {
+  assert.equal(plain(modelSegment({ model: { display_name: 'Fable 5' } })), 'Fabio 5');
+  assert.equal(plain(modelSegment({ model: { display_name: 'Opus 5' } })), 'Opus 5');
+  assert.equal(plain(modelSegment({ model: { id: 'claude-fable-5' } })), 'claude-Fabio-5');
   assert.equal(modelSegment({ model: { display_name: '   ' } }), null);
   assert.equal(modelSegment({}), null);
   assert.equal(modelSegment(undefined), null);
@@ -269,11 +275,11 @@ test('buildLevels drops bars first, then the model, and always keeps context', (
   const stdin = { model: { display_name: 'Fable 5' }, context_window: { used_percentage: 24 } };
   const limits = { fiveHour: { pct: 2 }, week: { pct: 9 } };
   const levels = buildLevels(stdin, limits);
-  assert.match(levels[0].join(' | '), /Model: Fable 5/);
+  assert.match(levels[0].join(' | '), /Fabio 5/);
   assert.match(levels[0].join(' | '), /5h:\[/);       // 5h bar present
   assert.doesNotMatch(levels[1].join(' | '), /5h:\[/); // bars gone
-  assert.match(levels[1].join(' | '), /Model: Fable 5/);
-  assert.doesNotMatch(levels[2].join(' | '), /Model:/); // model gone
+  assert.match(levels[1].join(' | '), /Fabio 5/);
+  assert.doesNotMatch(levels[2].join(' | '), /Fabio/); // model gone
   for (const level of levels) assert.match(level.join(' | '), /ctx:/);
 });
 
@@ -300,4 +306,97 @@ test('terminalWidth falls back to 80 only without COLUMNS and without a cache', 
   assert.equal(terminalWidth({ COLUMNS: 'wide' }, missing), 80);
   assert.equal(terminalWidth({ COLUMNS: '0' }, missing), 80);
   assert.equal(terminalWidth({ COLUMNS: '-10' }, missing), 80);
+});
+
+// ---------- usage cache is per account ----------
+
+test('configDir honours CLAUDE_CONFIG_DIR and defaults to ~/.claude', () => {
+  assert.equal(configDir({ CLAUDE_CONFIG_DIR: '/somewhere/.claude-alt' }), '/somewhere/.claude-alt');
+  assert.equal(configDir({}), join(homedir(), '.claude'));
+});
+
+test('usageCacheFile gives each account its own file in a shared tmpdir', () => {
+  const dir = tmpdir();
+  const personal = usageCacheFile({}, dir);
+  const second = usageCacheFile({ CLAUDE_CONFIG_DIR: join(homedir(), '.claude-pegasuz') }, dir);
+
+  // The whole point: one account's cached usage can never be read as another's.
+  assert.notEqual(personal, second);
+  assert.match(personal, /hud-usage-cache-[0-9a-f]{8}\.json$/);
+  assert.match(second, /hud-usage-cache-[0-9a-f]{8}\.json$/);
+});
+
+test('usageCacheFile is stable across runs and across equivalent paths', () => {
+  const dir = tmpdir();
+  const env = { CLAUDE_CONFIG_DIR: join(homedir(), '.claude-pegasuz') };
+  assert.equal(usageCacheFile(env, dir), usageCacheFile(env, dir));
+  // An unset var and an explicit default point at one account, so they must agree.
+  assert.equal(usageCacheFile({}, dir), usageCacheFile({ CLAUDE_CONFIG_DIR: join(homedir(), '.claude') }, dir));
+});
+
+// ---------- account chip ----------
+
+const CFG = {
+  accounts: {
+    'a@x.com': { label: 'mateo', color: '#9DC0B7' },
+    'b@y.com': { label: 'pegasuz', color: 'magenta' },
+  },
+  slots: {
+    '~/.claude': 'a@x.com',
+    '~/.claude-pegasuz': 'b@y.com',
+  },
+};
+
+test('chipColor renders hex as 24-bit and names as classic ANSI', () => {
+  assert.equal(chipColor('#9DC0B7'), '\x1b[38;2;157;192;183m');
+  assert.equal(chipColor('9DC0B7'), '\x1b[38;2;157;192;183m');
+  assert.equal(chipColor('magenta'), '\x1b[35m');
+  assert.equal(chipColor('CYAN'), '\x1b[36m');
+  assert.equal(chipColor('nope'), null);
+  assert.equal(chipColor(undefined), null);
+});
+
+test('slotOwner expands ~ and matches the equivalent absolute path', () => {
+  assert.equal(slotOwner(CFG, join(homedir(), '.claude')), 'a@x.com');
+  assert.equal(slotOwner(CFG, join(homedir(), '.claude-pegasuz')), 'b@y.com');
+  assert.equal(slotOwner(CFG, join(homedir(), '.claude-other')), null);
+  assert.equal(slotOwner(null, join(homedir(), '.claude')), null);
+});
+
+test('accountChip shows the mapped label in the mapped color', () => {
+  const chip = accountChip('a@x.com', join(homedir(), '.claude'), CFG);
+  assert.equal(plain(chip), 'mateo');
+  assert.match(chip, /38;2;157;192;183/);
+});
+
+test('accountChip flags a foreign credential in an owned slot in red', () => {
+  // The exact failure this exists for: pegasuz's credential swapped into ~/.claude.
+  const chip = accountChip('b@y.com', join(homedir(), '.claude'), CFG);
+  assert.equal(plain(chip), 'pegasuz!');
+  assert.match(chip, /\x1b\[31m/);
+  // Same credential in its own slot: normal rendering, no alarm.
+  assert.equal(plain(accountChip('b@y.com', join(homedir(), '.claude-pegasuz'), CFG)), 'pegasuz');
+});
+
+test('accountChip falls back to a dim localpart for unmapped accounts', () => {
+  const chip = accountChip('someone.long.address@z.com', join(homedir(), '.claude-other'), CFG);
+  assert.equal(plain(chip), 'someone.lo');
+  assert.match(chip, /\x1b\[2m/);
+  assert.equal(accountChip(null, join(homedir(), '.claude'), CFG), null);
+});
+
+test('accountChip narrows to a single letter, keeping the alarm', () => {
+  assert.equal(plain(accountChip('a@x.com', join(homedir(), '.claude'), CFG, { narrow: true })), 'm');
+  assert.equal(plain(accountChip('b@y.com', join(homedir(), '.claude'), CFG, { narrow: true })), 'p!');
+});
+
+test('buildLevels keeps the account chip at every level', () => {
+  const acct = { full: 'FULLCHIP', narrow: 'N' };
+  const levels = buildLevels(null, null, acct);
+  for (const [i, segs] of levels.entries()) {
+    const joined = segs.join('|');
+    assert.match(joined, i < 3 ? /FULLCHIP/ : /(^|\|)N(\||$)/, `level ${i}`);
+  }
+  // And without an account, no empty segment leaks in.
+  for (const segs of buildLevels(null, null, null)) assert.ok(segs.every(Boolean));
 });
