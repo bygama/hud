@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Use [GitHub private vulnerability reporting](https://github.com/BriarDevv/hud/security/advisories/new).
+Use [GitHub private vulnerability reporting](https://github.com/bygama/hud/security/advisories/new).
 Do not open public issues for security problems.
 
 You can expect an acknowledgment within a week. Please include reproduction
